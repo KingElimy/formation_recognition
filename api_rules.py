@@ -1,414 +1,427 @@
 """
-规则管理API - 扩展的规则管理接口
+缓存相关API接口 - 增量同步、编队查询、纯缓存操作
 """
+import logging
+from typing import List, Optional
+from datetime import datetime, timedelta
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Body, Path
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query, HTTPException, Body
 from fastapi.responses import JSONResponse
-from sqlalchemy.orm import Session
-from typing import List, Dict, Optional, Any
-from datetime import datetime
 
-from database import db_manager, get_db, RulePresetDB, RuleDB, SceneConfigDB
-from api_models import (
-    RulePreset, RuleConfig, RuleCreateRequest, RuleUpdateRequest,
-    PresetCreateRequest, PresetUpdateRequest, ReorderRequest,
-    RuleStatistics, ApiResponse
-)
+from cache.target_cache import target_cache
+from cache.formation_store import formation_store
+from sync.delta_sync import delta_sync
+from sync.websocket_manager import websocket_manager
+from formation_service import formation_service  # 导入服务实例
 
-router = APIRouter(prefix="/api/v1/rules", tags=["规则管理"])
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/cache", tags=["缓存与同步"])
 
 
-# ==================== 预设管理接口 ====================
+# ==================== 纯缓存操作接口（不触发识别） ====================
 
-@router.get("/presets", response_model=ApiResponse)
-async def list_presets(
-        category: Optional[str] = Query(None, description="分类筛选"),
-        include_rules: bool = Query(False, description="是否包含规则详情"),
-        db: Session = Depends(get_db)
+@router.post("/targets/batch_update")
+async def batch_update_targets(
+        targets: List[Dict] = Body(..., description="目标数据列表"),
+        emit_events: bool = Body(True, description="是否发送WebSocket事件")
 ):
-    """获取所有规则预设"""
-    presets = db_manager.get_presets(db, category=category, include_rules=include_rules)
-    return ApiResponse(
-        success=True,
-        data={"presets": presets, "count": len(presets)}
+    """
+    批量更新目标状态（仅缓存，不执行编队识别）
+
+    用于外部系统同步数据到缓存，供后续增量查询或识别使用
+    """
+    # 临时关闭事件发送，手动控制
+    result = formation_service.cache_targets_only(targets)
+
+    # 手动发送WebSocket事件
+    if emit_events:
+        for update in result.get("details", {}).get("updated", []):
+            if update.get("has_delta"):
+                tid = update["target_id"]
+                # 获取增量事件发送
+                try:
+                    import asyncio
+                    events = target_cache.get_delta_since(tid, update["version"] - 1)
+                    if events:
+                        asyncio.create_task(
+                            websocket_manager.notify_target_update(tid, events[-1])
+                        )
+                except Exception as e:
+                    logger.warning(f"发送事件失败: {e}")
+
+    return result
+
+
+@router.get("/targets/{target_id}/delta")
+async def get_target_delta(
+        target_id: str,
+        since_version: int = Query(..., description="起始版本号"),
+        limit: int = Query(100, ge=1, le=1000)
+):
+    """获取单个目标的增量历史"""
+    events = target_cache.get_delta_since(target_id, since_version)
+
+    # 限制数量
+    events = events[:limit]
+
+    return {
+        "success": True,
+        "target_id": target_id,
+        "since_version": since_version,
+        "events_count": len(events),
+        "events": events
+    }
+
+
+@router.get("/targets/{target_id}/history")
+async def get_target_history(
+        target_id: str,
+        start: datetime = Query(..., description="开始时间"),
+        end: datetime = Query(..., description="结束时间")
+):
+    """获取目标在指定时间范围内的历史增量"""
+    events = target_cache.get_delta_in_range(target_id, start, end)
+
+    return {
+        "success": True,
+        "target_id": target_id,
+        "time_range": {
+            "start": start.isoformat(),
+            "end": end.isoformat()
+        },
+        "events_count": len(events),
+        "events": events
+    }
+
+
+# ==================== 增量同步接口 ====================
+
+@router.post("/sync/session")
+async def create_sync_session(
+        client_id: str = Body(..., description="客户端唯一标识"),
+        target_ids: Optional[List[str]] = Body(None, description="关注的目标列表（空表示全部）")
+):
+    """创建同步会话"""
+    session_id = delta_sync.create_sync_session(client_id, target_ids)
+    return {
+        "success": True,
+        "session_id": session_id,
+        "expires_in": 3600,
+        "client_id": client_id,
+        "subscribed_targets": target_ids or "all"
+    }
+
+
+@router.post("/sync/pull")
+async def pull_delta(
+        session_id: Optional[str] = Body(None, description="同步会话ID"),
+        since_versions: Optional[dict] = Body(None, description="各目标版本号"),
+        target_ids: Optional[List[str]] = Body(None, description="目标列表")
+):
+    """
+    拉取增量数据
+
+    - 首次同步：不传入 since_versions，返回全量数据
+    - 增量同步：传入上次同步的版本号，返回差异
+    """
+    result = delta_sync.pull_delta(
+        session_id=session_id,
+        target_ids=target_ids,
+        since_versions=since_versions
     )
 
+    if "error" in result:
+        raise HTTPException(status_code=500, detail=result["error"])
 
-@router.get("/presets/{preset_id}", response_model=ApiResponse)
-async def get_preset(
-        preset_id: str = Path(..., description="预设ID"),
-        db: Session = Depends(get_db)
+    return {
+        "success": True,
+        "is_full_sync": result.get("full_sync", False),
+        "updated_targets": result.get("metadata", {}).get("updated_targets", 0),
+        "data": result
+    }
+
+
+@router.post("/sync/compare")
+async def compare_and_sync(client_states: dict = Body(...)):
+    """
+    对比同步 - 客户端上传本地状态，服务器返回差异
+
+    Request Body:
+    {
+        "target_id_1": {"version": 123, "hash": "abc..."},
+        "target_id_2": {"version": 456, "hash": "def..."}
+    }
+    """
+    result = delta_sync.compare_and_sync(client_states)
+    return {
+        "success": True,
+        "data": result
+    }
+
+
+# ==================== WebSocket实时推送 ====================
+
+@router.websocket("/ws/{client_id}")
+async def websocket_endpoint(websocket: WebSocket, client_id: str):
+    """WebSocket实时数据推送"""
+    await websocket_manager.connect(websocket, client_id)
+
+    try:
+        while True:
+            # 接收客户端消息
+            data = await websocket.receive_json()
+
+            msg_type = data.get("type")
+
+            if msg_type == "SUBSCRIBE":
+                # 订阅目标更新
+                target_ids = data.get("target_ids", [])
+                await websocket_manager.subscribe_targets(client_id, target_ids)
+
+                # 立即发送当前状态（全量）
+                if target_ids:
+                    full_state = delta_sync.pull_full_state(target_ids)
+                    await websocket_manager.send_personal_message(client_id, {
+                        "type": "INITIAL_STATE",
+                        "data": full_state
+                    })
+
+            elif msg_type == "UNSUBSCRIBE":
+                # 取消订阅
+                target_ids = data.get("target_ids", [])
+                await websocket_manager.unsubscribe_targets(client_id, target_ids)
+
+            elif msg_type == "PING":
+                # 心跳响应
+                await websocket_manager.send_personal_message(client_id, {
+                    "type": "PONG",
+                    "timestamp": datetime.now().isoformat()
+                })
+
+            elif msg_type == "GET_DELTA":
+                # 客户端请求增量
+                since_versions = data.get("since_versions", {})
+                result = delta_sync.pull_delta(since_versions=since_versions)
+                await websocket_manager.send_personal_message(client_id, {
+                    "type": "DELTA_RESPONSE",
+                    "data": result
+                })
+
+            else:
+                await websocket_manager.send_personal_message(client_id, {
+                    "type": "ERROR",
+                    "message": f"未知消息类型: {msg_type}"
+                })
+
+    except WebSocketDisconnect:
+        websocket_manager.disconnect(client_id)
+    except Exception as e:
+        logger.error(f"WebSocket错误 [{client_id}]: {e}")
+        websocket_manager.disconnect(client_id)
+
+
+# ==================== 编队结果查询接口 ====================
+
+@router.get("/formations/recent")
+async def get_recent_formations(
+        count: int = Query(10, ge=1, le=100, description="返回数量"),
+        include_tracks: bool = Query(False, description="是否包含完整航迹")
 ):
-    """获取预设详情"""
-    preset = db_manager.get_preset_by_id(db, preset_id)
-    if not preset:
-        raise HTTPException(status_code=404, detail="预设不存在")
+    """获取最近的编队识别结果"""
+    formations = formation_store.get_latest_formations(count)
 
-    return ApiResponse(
-        success=True,
-        data=preset.to_dict(include_rules=True)
-    )
+    if not include_tracks:
+        for f in formations:
+            f.pop("full_tracks", None)
+
+    return {
+        "success": True,
+        "count": len(formations),
+        "formations": formations
+    }
 
 
-@router.post("/presets", response_model=ApiResponse)
-async def create_preset(
-        request: PresetCreateRequest,
-        db: Session = Depends(get_db)
+@router.get("/formations/range")
+async def get_formations_by_time_range(
+        start: datetime = Query(..., description="开始时间 (ISO格式)"),
+        end: datetime = Query(..., description="结束时间 (ISO格式)"),
+        limit: int = Query(100, ge=1, le=1000)
 ):
-    """创建新预设"""
-    # 检查名称是否已存在
-    existing = db_manager.get_preset_by_name(db, request.name)
-    if existing:
-        raise HTTPException(status_code=400, detail="预设名称已存在")
+    """按时间范围查询编队"""
+    formations = formation_store.get_formations_by_time_range(start, end, limit)
 
-    preset_data = request.dict()
-    preset_data["category"] = "custom"
-    preset_data["is_default"] = False
-
-    preset = db_manager.create_preset(db, preset_data)
-
-    # 如果有初始规则，创建规则
-    if request.initial_rules:
-        for idx, rule_data in enumerate(request.initial_rules):
-            rule_dict = rule_data.dict()
-            rule_dict["preset_id"] = preset.id
-            rule_dict["order"] = idx
-            db_manager.create_rule(db, rule_dict)
-
-    return ApiResponse(
-        success=True,
-        message="预设创建成功",
-        data=preset.to_dict(include_rules=True)
-    )
+    return {
+        "success": True,
+        "count": len(formations),
+        "time_range": {
+            "start": start.isoformat(),
+            "end": end.isoformat()
+        },
+        "formations": formations
+    }
 
 
-@router.put("/presets/{preset_id}", response_model=ApiResponse)
-async def update_preset(
-        preset_id: str,
-        request: PresetUpdateRequest,
-        db: Session = Depends(get_db)
+@router.get("/formations/date/{date_str}")
+async def get_formations_by_date(
+        date_str: str,
+        limit: int = Query(1000, ge=1, le=5000)
 ):
-    """更新预设"""
-    preset = db_manager.update_preset(db, preset_id, request.dict(exclude_unset=True))
-    if not preset:
-        raise HTTPException(status_code=404, detail="预设不存在")
+    """按日期查询编队（格式: YYYYMMDD）"""
+    try:
+        date = datetime.strptime(date_str, "%Y%m%d")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="日期格式错误，应为YYYYMMDD")
 
-    return ApiResponse(
-        success=True,
-        message="预设更新成功",
-        data=preset.to_dict(include_rules=True)
-    )
+    formations = formation_store.get_formations_by_date(date, limit)
+
+    return {
+        "success": True,
+        "date": date_str,
+        "count": len(formations),
+        "formations": formations
+    }
 
 
-@router.delete("/presets/{preset_id}", response_model=ApiResponse)
-async def delete_preset(
-        preset_id: str,
-        hard: bool = Query(False, description="是否硬删除"),
-        db: Session = Depends(get_db)
+@router.get("/formations/{formation_id}")
+async def get_formation_detail(formation_id: str):
+    """获取编队详情"""
+    formation = formation_store.get_formation(formation_id)
+
+    if not formation:
+        raise HTTPException(status_code=404, detail="编队不存在或已过期")
+
+    return {
+        "success": True,
+        "formation": formation
+    }
+
+
+@router.get("/formations/statistics/overview")
+async def get_formation_statistics(
+        days: int = Query(7, ge=1, le=30, description="统计天数")
 ):
-    """删除预设"""
-    # 检查是否为系统预设
-    preset = db_manager.get_preset_by_id(db, preset_id)
-    if not preset:
-        raise HTTPException(status_code=404, detail="预设不存在")
+    """获取编队统计信息"""
+    stats = formation_store.get_formation_statistics(days)
 
-    if preset.category == "system" and hard:
-        raise HTTPException(status_code=403, detail="不能硬删除系统预设")
-
-    success = db_manager.delete_preset(db, preset_id, soft=not hard)
-    if not success:
-        raise HTTPException(status_code=500, detail="删除失败")
-
-    return ApiResponse(
-        success=True,
-        message="预设已删除" + ("（硬删除）" if hard else "（软删除）")
-    )
+    return {
+        "success": True,
+        "statistics": stats
+    }
 
 
-@router.post("/presets/{preset_id}/clone", response_model=ApiResponse)
-async def clone_preset(
-        preset_id: str,
-        new_name: str = Body(..., embed=True),
-        db: Session = Depends(get_db)
-):
-    """克隆预设"""
-    source = db_manager.get_preset_by_id(db, preset_id)
-    if not source:
-        raise HTTPException(status_code=404, detail="源预设不存在")
+# ==================== 目标状态查询接口 ====================
 
-    # 检查新名称
-    existing = db_manager.get_preset_by_name(db, new_name)
-    if existing:
-        raise HTTPException(status_code=400, detail="目标名称已存在")
+@router.get("/targets/active")
+async def get_active_targets():
+    """获取所有活跃目标"""
+    target_ids = target_cache.get_all_active_targets()
 
-    # 创建新预设
-    new_preset = db_manager.create_preset(db, {
-        "name": new_name,
-        "description": f"克隆自 {source.name}: {source.description}",
-        "category": "custom",
-        "is_default": False
-    })
+    return {
+        "success": True,
+        "count": len(target_ids),
+        "target_ids": target_ids
+    }
 
-    # 复制规则
-    for rule in source.rules:
-        rule_data = {
-            "preset_id": new_preset.id,
-            "name": rule.name,
-            "rule_type": rule.rule_type,
-            "priority": rule.priority,
-            "enabled": rule.enabled,
-            "weight": rule.weight,
-            "params": rule.params,
-            "description": rule.description,
-            "tags": rule.tags
+
+@router.post("/targets/batch_query")
+async def batch_query_targets(target_ids: List[str] = Body(...)):
+    """批量查询目标当前状态"""
+    states = target_cache.get_targets_batch(target_ids)
+
+    result = {}
+    for tid, state in states.items():
+        result[tid] = {
+            "position": {
+                "longitude": state.position.longitude,
+                "latitude": state.position.latitude,
+                "altitude": state.position.altitude
+            },
+            "heading": state.heading,
+            "speed": state.speed,
+            "timestamp": state.timestamp.isoformat()
         }
-        db_manager.create_rule(db, rule_data)
 
-    return ApiResponse(
-        success=True,
-        message="预设克隆成功",
-        data=new_preset.to_dict(include_rules=True)
-    )
+    return {
+        "success": True,
+        "found": len(result),
+        "not_found": list(set(target_ids) - set(result.keys())),
+        "states": result
+    }
 
 
-@router.post("/presets/{preset_id}/apply", response_model=ApiResponse)
-async def apply_preset(
-        preset_id: str,
-        db: Session = Depends(get_db)
+@router.get("/targets/{target_id}/state")
+async def get_target_state(target_id: str):
+    """获取目标当前状态"""
+    state = target_cache.get_target_state(target_id)
+
+    if not state:
+        raise HTTPException(status_code=404, detail="目标不存在或已过期")
+
+    return {
+        "success": True,
+        "target_id": target_id,
+        "state": {
+            "position": {
+                "longitude": state.position.longitude,
+                "latitude": state.position.latitude,
+                "altitude": state.position.altitude
+            },
+            "heading": state.heading,
+            "speed": state.speed,
+            "timestamp": state.timestamp.isoformat()
+        },
+        "version": target_cache.get_target_version(target_id)
+    }
+
+
+# ==================== 管理接口 ====================
+
+@router.post("/admin/cleanup")
+async def trigger_cleanup():
+    """手动触发数据清理"""
+    stats = formation_store.cleanup_expired_data()
+
+    return {
+        "success": True,
+        "message": "清理完成",
+        "stats": stats
+    }
+
+
+@router.get("/admin/status")
+async def get_admin_status():
+    """获取缓存管理状态"""
+    return {
+        "success": True,
+        "redis": {
+            "connected": formation_service.get_cache_status().get("redis_connected", False),
+            "active_targets": len(target_cache.get_all_active_targets())
+        },
+        "service": formation_service.get_statistics(),
+        "cache_stats": formation_service.cache_stats
+    }
+
+
+@router.post("/admin/clear")
+async def clear_cache(
+        target_ids: Optional[List[str]] = Body(None, description="指定目标（空表示全部）")
 ):
-    """应用预设到引擎"""
-    preset = db_manager.get_preset_by_id(db, preset_id)
-    if not preset:
-        raise HTTPException(status_code=404, detail="预设不存在")
-
-    # 这里调用引擎应用预设
-    # 实际实现需要访问FormationService
-
-    return ApiResponse(
-        success=True,
-        message=f"预设 {preset.name} 已应用",
-        data={"preset_id": preset_id, "preset_name": preset.name}
-    )
+    """清理缓存"""
+    result = formation_service.clear_cache(target_ids)
+    return result
 
 
-# ==================== 规则管理接口 ====================
+@router.get("/health")
+async def cache_health():
+    """缓存健康检查"""
+    from cache.redis_client import redis_client
 
-@router.get("/rules", response_model=ApiResponse)
-async def list_rules(
-        preset_id: Optional[str] = Query(None, description="预设ID筛选"),
-        enabled_only: bool = Query(False, description="仅启用的规则"),
-        db: Session = Depends(get_db)
-):
-    """获取规则列表"""
-    rules = db_manager.get_rules(db, preset_id=preset_id, enabled_only=enabled_only)
-    return ApiResponse(
-        success=True,
-        data={"rules": rules, "count": len(rules)}
-    )
+    redis_ok = redis_client.ping()
 
-
-@router.get("/rules/{rule_id}", response_model=ApiResponse)
-async def get_rule(
-        rule_id: str = Path(..., description="规则ID"),
-        include_history: bool = Query(False, description="包含历史记录"),
-        db: Session = Depends(get_db)
-):
-    """获取规则详情"""
-    rule = db_manager.get_rule_by_id(db, rule_id)
-    if not rule:
-        raise HTTPException(status_code=404, detail="规则不存在")
-
-    return ApiResponse(
-        success=True,
-        data=rule.to_dict(include_history=include_history)
-    )
-
-
-@router.post("/rules", response_model=ApiResponse)
-async def create_rule(
-        request: RuleCreateRequest,
-        db: Session = Depends(get_db)
-):
-    """创建规则"""
-    # 验证预设存在
-    preset = db_manager.get_preset_by_id(db, request.preset_id)
-    if not preset:
-        raise HTTPException(status_code=404, detail="预设不存在")
-
-    rule_data = request.dict()
-    rule = db_manager.create_rule(db, rule_data)
-
-    return ApiResponse(
-        success=True,
-        message="规则创建成功",
-        data=rule.to_dict()
-    )
-
-
-@router.put("/rules/{rule_id}", response_model=ApiResponse)
-async def update_rule(
-        rule_id: str,
-        request: RuleUpdateRequest,
-        performed_by: str = Query("api_user", description="操作人"),
-        db: Session = Depends(get_db)
-):
-    """更新规则"""
-    update_data = request.dict(exclude_unset=True)
-
-    rule = db_manager.update_rule(
-        db, rule_id, update_data,
-        performed_by=performed_by,
-        comment=request.comment
-    )
-
-    if not rule:
-        raise HTTPException(status_code=404, detail="规则不存在")
-
-    return ApiResponse(
-        success=True,
-        message="规则更新成功",
-        data=rule.to_dict()
-    )
-
-
-@router.delete("/rules/{rule_id}", response_model=ApiResponse)
-async def delete_rule(
-        rule_id: str,
-        performed_by: str = Query("api_user", description="操作人"),
-        db: Session = Depends(get_db)
-):
-    """删除规则"""
-    rule = db_manager.get_rule_by_id(db, rule_id)
-    if not rule:
-        raise HTTPException(status_code=404, detail="规则不存在")
-
-    # 检查是否为系统预设的规则
-    if rule.preset.category == "system":
-        # 允许删除但给出警告
-        pass
-
-    success = db_manager.delete_rule(db, rule_id, performed_by)
-    if not success:
-        raise HTTPException(status_code=500, detail="删除失败")
-
-    return ApiResponse(
-        success=True,
-        message="规则已删除"
-    )
-
-
-@router.post("/rules/{rule_id}/enable", response_model=ApiResponse)
-async def enable_rule(
-        rule_id: str,
-        performed_by: str = Query("api_user", description="操作人"),
-        db: Session = Depends(get_db)
-):
-    """启用规则"""
-    rule = db_manager.toggle_rule(db, rule_id, True, performed_by)
-    if not rule:
-        raise HTTPException(status_code=404, detail="规则不存在")
-
-    return ApiResponse(
-        success=True,
-        message="规则已启用",
-        data={"enabled": True}
-    )
-
-
-@router.post("/rules/{rule_id}/disable", response_model=ApiResponse)
-async def disable_rule(
-        rule_id: str,
-        performed_by: str = Query("api_user", description="操作人"),
-        db: Session = Depends(get_db)
-):
-    """禁用规则"""
-    rule = db_manager.toggle_rule(db, rule_id, False, performed_by)
-    if not rule:
-        raise HTTPException(status_code=404, detail="规则不存在")
-
-    return ApiResponse(
-        success=True,
-        message="规则已禁用",
-        data={"enabled": False}
-    )
-
-
-@router.post("/rules/reorder", response_model=ApiResponse)
-async def reorder_rules(
-        request: ReorderRequest,
-        db: Session = Depends(get_db)
-):
-    """重新排序规则"""
-    success = db_manager.reorder_rules(db, request.preset_id, request.rule_orders)
-    if not success:
-        raise HTTPException(status_code=400, detail="排序失败")
-
-    return ApiResponse(
-        success=True,
-        message="规则顺序已更新"
-    )
-
-
-# ==================== 统计和监控接口 ====================
-
-@router.get("/statistics", response_model=ApiResponse)
-async def get_statistics(db: Session = Depends(get_db)):
-    """获取规则统计信息"""
-    stats = db_manager.get_statistics(db)
-    return ApiResponse(
-        success=True,
-        data=stats
-    )
-
-
-@router.get("/rules/{rule_id}/history", response_model=ApiResponse)
-async def get_rule_history(
-        rule_id: str,
-        limit: int = Query(20, description="返回条数"),
-        db: Session = Depends(get_db)
-):
-    """获取规则修改历史"""
-    rule = db_manager.get_rule_by_id(db, rule_id)
-    if not rule:
-        raise HTTPException(status_code=404, detail="规则不存在")
-
-    history = sorted(rule.history, key=lambda h: h.performed_at, reverse=True)[:limit]
-
-    return ApiResponse(
-        success=True,
-        data={
-            "rule_id": rule_id,
-            "rule_name": rule.name,
-            "history": [h.to_dict() for h in history]
-        }
-    )
-
-
-# ==================== 场景配置接口 ====================
-
-@router.get("/scenes", response_model=ApiResponse)
-async def list_scenes(db: Session = Depends(get_db)):
-    """获取场景配置列表"""
-    scenes = db_manager.get_scenes(db)
-    return ApiResponse(
-        success=True,
-        data={"scenes": scenes}
-    )
-
-
-@router.put("/scenes/{scene_id}", response_model=ApiResponse)
-async def update_scene(
-        scene_id: str,
-        parameters: Dict[str, Any] = Body(...),
-        db: Session = Depends(get_db)
-):
-    """更新场景配置"""
-    scene = db_manager.update_scene(db, scene_id, {"parameters": parameters})
-    if not scene:
-        raise HTTPException(status_code=404, detail="场景不存在")
-
-    return ApiResponse(
-        success=True,
-        message="场景配置已更新",
-        data=scene.to_dict()
-    )
+    return {
+        "success": True,
+        "redis_connected": redis_ok,
+        "active_targets": len(target_cache.get_all_active_targets()),
+        "timestamp": datetime.now().isoformat()
+    }
