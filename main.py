@@ -26,6 +26,8 @@ from api_rules import router as rules_router
 from api_cache import router as cache_router  # 新增缓存路由
 from scheduler.cleanup import cleanup_scheduler  # 新增清理调度器
 from sync.websocket_manager import websocket_manager  # WebSocket管理器
+from api_stream import router as stream_router
+from stream_service import stream_service
 
 # 配置日志
 logging.basicConfig(
@@ -47,6 +49,9 @@ async def lifespan(app: FastAPI):
     # 初始化编队服务（含Redis缓存）
     formation_service.initialize()
 
+    # 启动数据流服务（可选，默认启动）
+    stream_service.initialize("tight_fighter")
+
     # 启动定时清理任务
     cleanup_scheduler.start()
 
@@ -55,6 +60,7 @@ async def lifespan(app: FastAPI):
 
     # 关闭时
     logger.info("服务关闭中...")
+    stream_service.shutdown()
     cleanup_scheduler.shutdown()
     formation_service.cleanup()
     logger.info("服务已关闭")
@@ -320,6 +326,7 @@ async def websocket_status():
 
 app.include_router(rules_router)
 app.include_router(cache_router)  # 注册缓存路由
+app.include_router(stream_router)
 
 # 启动入口
 if __name__ == "__main__":
